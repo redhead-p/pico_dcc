@@ -1,0 +1,91 @@
+;  DCC module
+    
+
+;  Copyright Paul Redhead, 2024
+
+.program dcc_gen
+.side_set 1
+
+
+
+
+.wrap_target
+
+
+    mov x,  isr             side 1    [0]     ; isr will be set later - assumed 0 first time
+    jmp !x, nxt_byte        side 1    [0]     ; if 0 - packet end bit not set on preceeding byte
+    ; packet end bit '1' to do - do the high side - 27 ticks here + 2
+    set y,  0               side 1     [8]     ; loop counter 1 bit only
+    mov isr, y              side 1     [8]     ; and clear isr too to mark end bit done
+    jmp short_low           side 1     [8]     ; normal short bit code for low half cycle
+
+nxt_byte:
+    ;  set x to default value for OSR to be used if FIFO empty 
+    ;  7 ticks from here to 'nxt_bit' for both paths - 9 cumulative
+    set x, 0                side 1     [0]
+    ; pull word from FIFO
+    ; 32 bits are pulled
+    ; if FIFO is empty register x  0  is copied to OSR
+    ; so we send '0's
+    pull noblock            side 1     [0]
+    out x,1                 side 1     [0]    ; get first bit
+    jmp !x, data_byte       side 1     [0]    ; if 0 it's normal data
+
+    ; pre-amble or delay padding
+    out null, 15            side 1     [0]     ; discard unused bits
+    set y, 15               side 1     [0]     ; load loop counter for 16 bits
+    jmp nxt_bit             side 1     [0]
+    
+
+data_byte:
+    out isr,1               side 1     [0]     ; put the next bit in the isr for next loop
+    out null, 21            side 1     [0]     ; discard unused bits
+    set y, 8                side 1     [0]     ; load loop counter for 9 bits
+
+nxt_bit:
+    ; 18 ticks high high for short  1  and long  0  - cummulative 27 
+    out x,1                 side 1     [8]    ; get next output bit
+    jmp !x, long_high       side 1     [8]    ; if 0 it's long
+    
+    ; 2 ticks high for short  1  only - cummulative 29  full short 1st half cycle 
+    jmp short_low           side 1     [1]     ; it's short - low half cycle next
+    
+long_high:
+     ; 23 ticks high for long  0  only - cummulative 50  full long 1st half cycle 
+    nop                     side 1     [10]    ; long half cycle is 21 ticks longer
+    nop                     side 1     [11]
+
+     ; 21 ticks low for long  0  only - cummulative low 21  2nd half cycle  
+    nop                      side 0     [9]     ; for both high & low op
+    nop                      side 0     [10]
+
+short_low:
+    ; 29 ticks low for short  1  and long  0  - cummulative short 29, long 50  full cycles 
+    nop                      side 0     [14]    ; common part - both 1 & 0
+    jmp y--, not_done      side 0     [13]    ; test bit count
+.wrap                                        ; start next single bit/ byte group
+
+
+not_done:
+    ; 9 ticks high for short  1  and long  0  - same as 1st  instructions skipped 
+    jmp nxt_bit            side 1     [8]     ; done this bit - do next bit            
+
+% c-sdk {
+static inline void dcc_gen_program_init(PIO pio, uint sm, uint offset, uint pin, float freq) {
+    pio_sm_config c = dcc_gen_get_default_config(offset);
+
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_shift(&c, false, false,  32);  // msb first, no autopull
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    
+
+    // Load our configuration, and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+    // Set the state machine running
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
