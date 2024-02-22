@@ -1,7 +1,7 @@
 """DCC module
     :author: Paul Redhead
 
-        Copyright Paul Redhead, 2023
+        Copyright Paul Redhead, 2023, 2024
 
 This module contains the functions and classes for DCC generation.
 
@@ -52,6 +52,7 @@ _PACKET_PERIOD = const(15)          # ms between each DCC packet
 
 _MAX_LONG_ADDR = const(0x27FF)      # DCC long address upper limit (inclusive)
 _MIN_LONG_ADDR = const(128)         # DCC long address lower limit (inclusive)
+_BASE_LONG_ADDR = const(0xc000)     # DCC long mobile address range base
 _SPD_128 = const(0x3f)              # 1st instruction byte for 128 speed packet
 _F_GROUP_1 = const(0x80)            # instruction byte for Function group 1
 _F_NUM_ENCODE = [0x10, 0x01, 0x02, 0x04, 0x08] # translate Group 1 function no. to mask
@@ -61,9 +62,9 @@ _DCC_LAST_BYTE = const(0x40000000)  # last byte marker - packet end '1' bit appe
 
 
 
-@rp2.asm_pio(sideset_init=rp2.PIO.OUT_HIGH,  
-             out_shiftdir=rp2.PIO.SHIFT_LEFT, 
-               fifo_join = rp2.PIO.JOIN_TX)
+@rp2.asm_pio(sideset_init = rp2.PIO.OUT_HIGH,  
+             out_shiftdir = rp2.PIO.SHIFT_LEFT, 
+               fifo_join  = rp2.PIO.JOIN_TX)
 def _dcc_gen():
     """PIO Generate DCC
     
@@ -71,14 +72,16 @@ def _dcc_gen():
     OSR is set to shift left so the Most Significant bits are shifted out first.
     The side pin is set to the DCC signal by .side(x).
 
-    As this is output only we can use the Input Shift Register (ISR) as an additional store.
+    The RX FIFO is joined to the TX FIFO so doubling the TX FIFO length.
+
+    As this is output only we can use the Input Shift Register (ISR/isr) as an additional store.
     """
 
     wrap_target()
     # do nominally high side of the cycle first
     #  2 ticks high for short (1) and long (0)
     mov(x, isr)             .side(1)    [0]     # isr will be set later - assumed 0 first time
-    jmp(not_x, "nxt_byte")  .side(1)    [0]     # if 0 - packet end bit not set on preceeding byte
+    jmp(not_x, "nxt_byte")  .side(1)    [0]     # if 0 - packet end bit not set on preceding byte
     # packet end bit '1' to do - do the high side - 27 ticks here + 2
     set(y, 0)               .side(1)    [8]     # loop counter 1 bit only
     mov(isr, y)             .side(1)    [8]     # and clear isr too to mark end bit done
@@ -104,7 +107,8 @@ def _dcc_gen():
     
 
     label ("data_byte")
-    out(isr,1)              .side(1)    [0]     # put the next bit in the isr for next loop
+    # put the last byte indicator bit in the isr for next loop
+    out(isr,1)              .side(1)    [0]     
     out(null, 21)           .side(1)    [0]     # discard unused bits
     set(y, 8)               .side(1)    [0]     # load loop counter for 9 bits
 
@@ -145,8 +149,8 @@ class DCCGen:
 
     The PIO has to be fed with words.  If the top bit (bit 31) is set the word contains
     pre-amble ('1's) or filler ('0's).  16 bits are output. If bit 31 is clear the word contains 
-    a  preceeding bit and output byte. 9 bits are otput. Bit 30 set indicates the last byte
-    (usually checksum). Following this yhe packet end '1' bit is appended by the PIO.
+    a  preceeding bit and output byte. 9 bits are output. Bit 30 set indicates the last byte
+    (usually checksum). Following this the packet end '1' bit is appended by the PIO.
     
 
     Attributes:
@@ -158,7 +162,7 @@ class DCCGen:
         
     """
 
-    # class constants - may be imported 
+    # class constants - may be imported by other modules
 
     IDLE_PACKET = bytes(b'\xff\x00')  # Address 255, instruction/data 0
 
@@ -190,7 +194,7 @@ class DCCGen:
 
     
     
-    def __init__(self, sm_num, DCC_pn, enable_pn):
+    def __init__(self, sm_num, DCC_pn, power_pn):
         """DCC generator constructor
         
         This initialises the DCC generator singleton.  An attempt to create a 2nd
@@ -203,14 +207,14 @@ class DCCGen:
             self:
             sm_num: PIO statemachine number to be used.
             DCC_pn: Pin number allocated for DCC output.
-            enable_pn: Pin number allocated to enable the booster."""
+            power_pn: Pin number allocated to the booster for powering the track"""
 
         if not DCCGen._this_dcc is None:
             raise RuntimeError ('Attempt to create 2nd DCC gen')
         DCCGen._this_dcc = self
         
-        self._sm = rp2.StateMachine(sm_num, _dcc_gen, freq= _PIO_FREQ, sideset_base = Pin(DCC_pn, Pin.OUT))                    
-        self._enable_pin = Pin(enable_pn, Pin.OUT, value = 0)
+        self._sm = rp2.StateMachine(sm_num, _dcc_gen, freq = _PIO_FREQ, sideset_base = Pin(DCC_pn, Pin.OUT))                    
+        self._power_pin = Pin(power_pn, Pin.OUT, value = 0)
         self._packet_timer = Timer()
         self._packet_list = {}              # create empty dictionary
         self._FIFO_buff = array.array('I', range(8)) # FIFO buffer is 8 words but 'I' not 'L'
@@ -239,22 +243,22 @@ class DCCGen:
             p: 1 for power on, 0 for power off, None for get power status
 
         returns:
-            power status as held by the enable pin
+            power status as held by the power pin
 
         """
         if (p is None):
-            return self._enable_pin()
+            return self._power_pin()
         if p == DCCGen.ON:
-            self._enable_pin(1)
+            self._power_pin(1)
             self._sm.active(True)
             self._packet_timer.init(mode = Timer.PERIODIC, period = _PACKET_PERIOD, callback = self._nxt_packet)
             # set an iterator up so we can do one packet per timer callback
             self._packet_iter = iter(self._packet_list)
         else:
-            self._enable_pin(0)
+            self._power_pin(0)
             self._sm.active(False)
             self._packet_timer.deinit()
-        return self._enable_pin()
+        return self._power_pin()
     
     def set_speed(self, address, dir, speed = 0):
         """Set Speed (including direction)
@@ -353,7 +357,7 @@ class DCCGen:
                 self._packet_list[('F', address)] = bytearray((msb_address, address & 0xff, inst_1))
 
         return True
-        
+    
 
 
     
@@ -389,20 +393,22 @@ class DCCGen:
         Set up the FIFO buffer with preample, data from the byte list, 
         and checksum.  Then transfer to PIO FIFO.
         """
-        byte_count = len(byte_list)
-        if byte_count > 5: # max is 6 but that includes chksum
+        if len(byte_list) > 5: # max is 6 but that includes chksum
             raise RuntimeError ('DCC command too long')
-        self._FIFO_buff[0] = _DCC_PREAMBLE
-        count = 1
+        
+        buff_mv = memoryview(self._FIFO_buff) 
+        buff_mv[0] = _DCC_PREAMBLE
         err_detect = 0  # initialise error detection checksum
+        count = 1
         for b in byte_list:
-            self._FIFO_buff[count] = b
-            count += 1
+            buff_mv[count] = b
             err_detect ^= b
-        self._FIFO_buff[1 + byte_count] = err_detect | _DCC_LAST_BYTE
-        self._sm.put(memoryview(self._FIFO_buff[0:byte_count + 2]))
+            count += 1
+        buff_mv[len(byte_list) + 1] = err_detect | _DCC_LAST_BYTE
+        self._sm.put(buff_mv[0:len(byte_list) + 2])
+
         
         
-        
+    
 if __name__ == '__main__':
     dcc = DCCGen(0, 20, 19) # state machine 0, DCC pin 20, enable pin 19
